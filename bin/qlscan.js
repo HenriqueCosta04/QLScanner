@@ -1,63 +1,135 @@
 #!/usr/bin/env node
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import yargs from 'yargs';
-import { hideBin } from 'yargs/helpers';
-import { ensureCodeQL } from '../lib/bootstrap.js';
-import { runScan } from '../lib/scan.js';
-import { existsSync, mkdirSync, writeFileSync, chmodSync } from 'fs';
-import { execSync } from 'child_process';
-import chalk from 'chalk';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const TOOL_HOME = join(process.cwd(), '.qlscan-cache');
+import yargs from "yargs";
+import { hideBin } from "yargs/helpers";
+import { existsSync, writeFileSync, chmodSync } from "fs";
+import { execSync } from "child_process";
+import { join } from "path";
+import chalk from "chalk";
 
-const argv = yargs(hideBin(process.argv))
-  .command('init-hook', 'Instalação do hook de pré-commit', () => {}, async () => {
-    const hookDir = join(process.cwd(), '.git', 'hooks');
-    const hookFile = join(hookDir, 'pre-commit');
-    if (!existsSync(hookDir)) {
-      console.error('Não é um repositório Git. Por favor, verifique seu projeto e tente novamente.');
-      process.exit(1);
-    }
-    const stub = `#!/usr/bin/env bash\n npx qlscan hook\n`;
-    writeFileSync(hookFile, stub);
-    chmodSync(hookFile, 0o755);
-    console.log(chalk.green('✓ Hook de pré-commit instalado.'));
-  })
-  .command('hook', 'Interno: Execução do Hook', () => {}, async () => {
-    try {
-      const codeql = await ensureCodeQL(TOOL_HOME);
-      const changed = execSync('git diff --cached --name-only --diff-filter=ACM').toString();
-      if (!changed.match(/\.(js|py|cs)$/)) process.exit(0);
-      const issues = await runScan(codeql, TOOL_HOME, process.cwd());
-      if (issues > 0) {
-        console.log(chalk.yellow(`⚠️  ${issues} vulnerabilidade(s) encontrada(s) pelo CodeQL.`));
-        const answer = await prompt('Tem certeza que deseja continuar? [y/N]: ');
-        if (!/^y(es)?$/i.test(answer.trim())) process.exit(1);
-      }
-    } catch (e) {
-      console.error(chalk.red(e.message));
-      process.exit(1);
-    }
-  })
-  .command('scan', 'Escaneamento manual do repositório atual', () => {}, async () => {
-    const codeql = await ensureCodeQL(TOOL_HOME);
-    await runScan(codeql, TOOL_HOME, process.cwd());
-  })
-  .demandCommand(1)
-  .help()
-  .option('verbose', {
-    alias: 'v',
-    type: 'boolean',
-    description: 'Exibe informações detalhadas durante a execução'
-  })
-  .argv;
+import { ensureCodeQL } from "../lib/bootstrap.js";
+import { runScan } from "../lib/scan.js";
 
-function prompt(q) {
-  return new Promise(resolve => {
-    process.stdout.write(q);
-    process.stdin.once('data', d => resolve(d.toString()));
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Prompts the user for input on stdin and returns the trimmed response.
+ * @param {string} question - The question to display.
+ * @returns {Promise<string>}
+ */
+function prompt(question) {
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    process.stdin.once("data", (data) => resolve(data.toString().trim()));
   });
 }
+
+/**
+ * Returns true if any of the provided newline-separated file paths
+ * match a scannable extension.
+ * @param {string} changedFiles - Output of `git diff --cached --name-only`.
+ * @returns {boolean}
+ */
+function hasSupportedFiles(changedFiles) {
+  return changedFiles
+    .split("\n")
+    .some((line) => /\.(js|ts|jsx|tsx|py|cs)$/.test(line.trim()));
+}
+
+// ---------------------------------------------------------------------------
+// CLI definition
+// ---------------------------------------------------------------------------
+
+yargs(hideBin(process.argv))
+  // ── init-hook ────────────────────────────────────────────────────────────
+  .command(
+    "init-hook",
+    "Install the pre-commit Git hook",
+    () => {},
+    async () => {
+      const hookDir = join(process.cwd(), ".git", "hooks");
+      const hookFile = join(hookDir, "pre-commit");
+
+      if (!existsSync(hookDir)) {
+        console.error(
+          chalk.red(
+            "✖  Not a Git repository. Please run this command inside a Git project.",
+          ),
+        );
+        process.exit(1);
+      }
+
+      const stub = `#!/usr/bin/env bash\nnpx qlscan hook\n`;
+      writeFileSync(hookFile, stub);
+      chmodSync(hookFile, 0o755);
+      console.log(chalk.green("✔  Pre-commit hook installed successfully."));
+    },
+  )
+
+  // ── hook (internal – called by the pre-commit script) ────────────────────
+  .command(
+    "hook",
+    false, // hidden from help output; internal use only
+    () => {},
+    async () => {
+      try {
+        const changedFiles = execSync(
+          "git diff --cached --name-only --diff-filter=ACM",
+        ).toString();
+
+        if (!hasSupportedFiles(changedFiles)) {
+          process.exit(0);
+        }
+
+        const codeqlPath = await ensureCodeQL();
+        const issueCount = await runScan(codeqlPath, process.cwd());
+
+        if (issueCount > 0) {
+          console.log(
+            chalk.yellow(
+              `\n⚠  ${issueCount} vulnerability(ies) found by CodeQL.`,
+            ),
+          );
+          const answer = await prompt("Do you still want to commit? [y/N]: ");
+          if (!/^y(es)?$/i.test(answer)) {
+            process.exit(1);
+          }
+        }
+      } catch (err) {
+        console.error(chalk.red("✖  Hook failed:"), err.message);
+        process.exit(1);
+      }
+    },
+  )
+
+  // ── scan ─────────────────────────────────────────────────────────────────
+  .command(
+    "scan",
+    "Manually scan the current repository",
+    () => {},
+    async () => {
+      try {
+        const codeqlPath = await ensureCodeQL();
+        await runScan(codeqlPath, process.cwd());
+      } catch (err) {
+        console.error(chalk.red("✖  Scan failed:"), err.message);
+        process.exit(1);
+      }
+    },
+  )
+
+  // ── global options ────────────────────────────────────────────────────────
+  .option("verbose", {
+    alias: "v",
+    type: "boolean",
+    description: "Show detailed output during execution",
+  })
+  .demandCommand(
+    1,
+    chalk.red("Please specify a command. Use --help for usage."),
+  )
+  .strict()
+  .help()
+  .parse();
